@@ -1,302 +1,537 @@
-import tkinter as tk
-from tkinter import ttk, messagebox, simpledialog
 import os
 import json
 from datetime import datetime
+import streamlit as st
 
-class TabletPiezometerApp:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("Field Piezometer Pro - Tablet Touch Ready")
-        
-        # 태블릿 해상도에 맞춰 크기 조절 (가로 850, 세로 950)
-        self.root.geometry("850x950")
-        self.root.configure(bg="#F5F7FA")
-        
-        self.base_dir = "Sites_Data"
-        if not os.path.exists(self.base_dir):
-            os.makedirs(self.base_dir)
+BASE_DIR = "Sites_Data"
+os.makedirs(BASE_DIR, exist_ok=True)
 
-        self.calib_rows = []
-        self.current_lgf_field = 0.0
-        self.create_widgets()
+INFO_FIELDS = [
+    ("관리번호:", "mng_no"),
+    ("수위계 S/N:", "serial_no"),
+    ("천공심도(m):", "bore_depth"),
+    ("수위(m):", "water_level"),
+    ("설치위치(m):", "install_pos"),
+]
 
-    def create_widgets(self):
-        # 1. 상단 타이틀 바
-        header = tk.Frame(self.root, bg="#1E293B", height=70)
-        header.pack(fill="x", side="top")
-        tk.Label(header, text="지하수위계 현장 캘리브레이션 시스템", font=("맑은 고딕", 18, "bold"), 
-                 bg="#1E293B", fg="white").pack(pady=20)
+BASE_STAGES = ["설치 전 측정치", "설치 후 측정치", "초기치"]
 
-        # 2. 메인 스크롤 영역 설정
-        self.main_container = tk.Canvas(self.root, bg="#F5F7FA", highlightthickness=0)
-        self.scrollbar = ttk.Scrollbar(self.root, orient="vertical", command=self.main_container.yview)
-        self.scrollable_frame = tk.Frame(self.main_container, bg="#F5F7FA")
 
-        self.scrollable_frame.bind(
-            "<Configure>",
-            lambda e: self.main_container.configure(scrollregion=self.main_container.bbox("all"))
+def list_sites():
+    return sorted(
+        [
+            d for d in os.listdir(BASE_DIR)
+            if os.path.isdir(os.path.join(BASE_DIR, d))
+        ]
+    )
+
+
+def list_records(site):
+    if not site:
+        return []
+    site_path = os.path.join(BASE_DIR, site)
+    if not os.path.isdir(site_path):
+        return []
+    return sorted(
+        [f[:-5] for f in os.listdir(site_path) if f.endswith(".json")]
+    )
+
+
+def ensure_state():
+    defaults = {
+        "selected_site": "",
+        "new_site_name": "",
+        "spec_lgf": "",
+        "current_lgf_field": 0.0,
+        "match_rate": None,
+        "calib_count": 5,
+        "record_to_manage": "",
+        "delete_confirm": False,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+    for _, state_key in INFO_FIELDS:
+        st.session_state.setdefault(f"info_{state_key}", "")
+
+    for stage in BASE_STAGES:
+        st.session_state.setdefault(f"base_digits_{stage}", "")
+        st.session_state.setdefault(f"base_temp_{stage}", "")
+
+    for i in range(100):
+        st.session_state.setdefault(f"calib_depth_{i}", "")
+        st.session_state.setdefault(f"calib_digits_{i}", "")
+
+
+def clear_all():
+    for _, state_key in INFO_FIELDS:
+        st.session_state[f"info_{state_key}"] = ""
+
+    st.session_state["spec_lgf"] = ""
+    st.session_state["current_lgf_field"] = 0.0
+    st.session_state["match_rate"] = None
+
+    for stage in BASE_STAGES:
+        st.session_state[f"base_digits_{stage}"] = ""
+        st.session_state[f"base_temp_{stage}"] = ""
+
+    for i in range(100):
+        st.session_state[f"calib_depth_{i}"] = ""
+        st.session_state[f"calib_digits_{i}"] = ""
+
+    st.session_state["calib_count"] = 5
+
+
+def add_site(site_name):
+    site_name = site_name.strip()
+    if not site_name:
+        st.warning("현장명을 입력하세요.")
+        return
+
+    path = os.path.join(BASE_DIR, site_name)
+    if not os.path.exists(path):
+        os.makedirs(path)
+
+    st.session_state["selected_site"] = site_name
+    st.session_state["new_site_name"] = ""
+    st.success(f"'{site_name}' 현장이 추가되었습니다.")
+
+
+def collect_calib_rows():
+    rows = []
+    for i in range(st.session_state["calib_count"]):
+        depth = st.session_state.get(f"calib_depth_{i}", "").strip()
+        digits = st.session_state.get(f"calib_digits_{i}", "").strip()
+        rows.append({"depth": depth, "digits": digits})
+    return rows
+
+
+def calculate_lgf():
+    try:
+        depths, digits = [], []
+
+        for i in range(st.session_state["calib_count"]):
+            depth_raw = st.session_state.get(f"calib_depth_{i}", "").strip()
+            digits_raw = st.session_state.get(f"calib_digits_{i}", "").strip()
+
+            if depth_raw and digits_raw:
+                depths.append(float(depth_raw))
+                digits.append(float(digits_raw))
+            elif depth_raw or digits_raw:
+                return False, f"{i + 1}번째 행은 수심과 Digits를 모두 입력해야 합니다."
+
+        if len(depths) < 2:
+            return False, "캘리브레이션 데이터는 2개 이상 입력해야 합니다."
+
+        base_depth, base_digits = depths[0], digits[0]
+        lgfs = []
+
+        for i in range(1, len(depths)):
+            dp = (depths[i] - base_depth) * 0.1
+            dd = digits[i] - base_digits
+            if dd != 0:
+                lgfs.append(dp / dd)
+
+        if not lgfs:
+            return False, "Digits 차이가 0이어서 L.G.F를 계산할 수 없습니다."
+
+        field_lgf = sum(lgfs) / len(lgfs)
+        st.session_state["current_lgf_field"] = field_lgf
+        st.session_state["match_rate"] = None
+
+        spec_raw = st.session_state.get("spec_lgf", "").strip()
+        if spec_raw:
+            spec_lgf = float(spec_raw)
+            if max(abs(spec_lgf), abs(field_lgf)) == 0:
+                match_rate = 100.0
+            else:
+                match_rate = (
+                    min(abs(spec_lgf), abs(field_lgf))
+                    / max(abs(spec_lgf), abs(field_lgf))
+                ) * 100
+            st.session_state["match_rate"] = match_rate
+
+        return True, "L.G.F 계산이 완료되었습니다."
+
+    except ValueError:
+        return False, "숫자 형식을 확인하세요."
+
+
+def save_data():
+    site = st.session_state.get("selected_site", "").strip()
+    mng_no = st.session_state.get("info_mng_no", "").strip()
+
+    if not site or not mng_no:
+        return False, "현장명과 관리번호는 필수입니다."
+
+    site_path = os.path.join(BASE_DIR, site)
+    os.makedirs(site_path, exist_ok=True)
+
+    data = {
+        "info": {
+            label: st.session_state.get(f"info_{state_key}", "")
+            for label, state_key in INFO_FIELDS
+        },
+        "spec_lgf": st.session_state.get("spec_lgf", ""),
+        "base": {
+            stage: {
+                "Digits": st.session_state.get(f"base_digits_{stage}", ""),
+                "Temp": st.session_state.get(f"base_temp_{stage}", ""),
+            }
+            for stage in BASE_STAGES
+        },
+        "calib": collect_calib_rows(),
+        "field_lgf": st.session_state.get("current_lgf_field", 0.0),
+    }
+
+    file_path = os.path.join(site_path, f"{mng_no}.json")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+    return True, f"{mng_no} 데이터가 저장되었습니다."
+
+
+def load_data(site, record_name):
+    if not site or not record_name:
+        return False, "불러올 데이터를 선택하세요."
+
+    file_path = os.path.join(BASE_DIR, site, f"{record_name}.json")
+    if not os.path.exists(file_path):
+        return False, "선택한 데이터 파일이 없습니다."
+
+    with open(file_path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    clear_all()
+    st.session_state["selected_site"] = site
+
+    info = data.get("info", {})
+    label_to_state = {label: state_key for label, state_key in INFO_FIELDS}
+    for label, value in info.items():
+        state_key = label_to_state.get(label)
+        if state_key:
+            st.session_state[f"info_{state_key}"] = value
+
+    st.session_state["spec_lgf"] = data.get("spec_lgf", "")
+
+    base = data.get("base", {})
+    for stage in BASE_STAGES:
+        stage_data = base.get(stage, {})
+        st.session_state[f"base_digits_{stage}"] = stage_data.get("Digits", "")
+        st.session_state[f"base_temp_{stage}"] = stage_data.get("Temp", "")
+
+    calib = data.get("calib", [])
+    st.session_state["calib_count"] = max(5, len(calib))
+    for i, row in enumerate(calib):
+        st.session_state[f"calib_depth_{i}"] = row.get("depth", "")
+        st.session_state[f"calib_digits_{i}"] = row.get("digits", "")
+
+    field_lgf = data.get("field_lgf", 0.0)
+    try:
+        st.session_state["current_lgf_field"] = float(field_lgf)
+    except (ValueError, TypeError):
+        st.session_state["current_lgf_field"] = 0.0
+
+    st.session_state["match_rate"] = None
+    spec_raw = str(st.session_state.get("spec_lgf", "")).strip()
+    if spec_raw:
+        try:
+            spec_lgf = float(spec_raw)
+            field_lgf = float(st.session_state["current_lgf_field"])
+            if max(abs(spec_lgf), abs(field_lgf)) == 0:
+                st.session_state["match_rate"] = 100.0
+            else:
+                st.session_state["match_rate"] = (
+                    min(abs(spec_lgf), abs(field_lgf))
+                    / max(abs(spec_lgf), abs(field_lgf))
+                ) * 100
+        except ValueError:
+            st.session_state["match_rate"] = None
+
+    return True, f"{record_name} 데이터를 불러왔습니다."
+
+
+def delete_data(site, record_name):
+    if not site or not record_name:
+        return False, "삭제할 데이터를 선택하세요."
+
+    file_path = os.path.join(BASE_DIR, site, f"{record_name}.json")
+    if not os.path.exists(file_path):
+        return False, "선택한 데이터 파일이 없습니다."
+
+    os.remove(file_path)
+    return True, f"{record_name} 데이터가 삭제되었습니다."
+
+
+def build_export_text(site):
+    if not site:
+        return None, None
+
+    site_path = os.path.join(BASE_DIR, site)
+    if not os.path.isdir(site_path):
+        return None, None
+
+    files = sorted([f for f in os.listdir(site_path) if f.endswith(".json")])
+    if not files:
+        return None, None
+
+    lines = [f"=== {site} 지하수위계 일괄 데이터 ===", ""]
+
+    for file_name in files:
+        with open(os.path.join(site_path, file_name), "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        info = data.get("info", {})
+        field_lgf = data.get("field_lgf", 0)
+        try:
+            field_lgf_text = f"{float(field_lgf):.7f}"
+        except (ValueError, TypeError):
+            field_lgf_text = "0.0000000"
+
+        lines.append(f"■ 관리번호: {info.get('관리번호:', 'N/A')}")
+        lines.append(
+            f"S/N: {info.get('수위계 S/N:', '')} | 현장LGF: {field_lgf_text}"
+        )
+        lines.append(f"성적서LGF: {data.get('spec_lgf', '미입력')}")
+        lines.append("------------------------------------------")
+
+    content = "\n".join(lines)
+    now = datetime.now().strftime("%Y%m%d_%H%M")
+    filename = f"{site}_일괄데이터_{now}.txt"
+    return filename, content
+
+
+def render_header():
+    st.markdown(
+        """
+        <div style="
+            background: linear-gradient(90deg, #0f172a 0%, #1e293b 100%);
+            padding: 18px 24px;
+            border-radius: 14px;
+            margin-bottom: 20px;
+        ">
+            <h2 style="color: white; margin: 0;">지하수위계 현장 캘리브레이션 시스템</h2>
+            <p style="color: #CBD5E1; margin: 6px 0 0 0;">Field Piezometer Pro - Streamlit Web Edition</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def main():
+    st.set_page_config(
+        page_title="Field Piezometer Pro",
+        page_icon="📐",
+        layout="wide",
+    )
+
+    ensure_state()
+    render_header()
+
+    st.subheader("1. 현장 및 관리")
+    sites = list_sites()
+    site_options = [""] + sites
+
+    if st.session_state["selected_site"] not in site_options:
+        st.session_state["selected_site"] = site_options[0]
+
+    col1, col2, col3 = st.columns([2, 2, 1])
+
+    with col1:
+        st.selectbox(
+            "현장 선택",
+            options=site_options,
+            key="selected_site",
+            format_func=lambda x: "현장을 선택하세요" if x == "" else x,
         )
 
-        # 캔버스 중앙에 내용 프레임 배치
-        self.canvas_window = self.main_container.create_window((425, 0), window=self.scrollable_frame, anchor="n")
-        self.main_container.configure(yscrollcommand=self.scrollbar.set)
+    with col2:
+        st.text_input("새 현장명", key="new_site_name", placeholder="예: OO현장 A구간")
 
-        # 터치 스크롤 바인딩 (태블릿 핵심 기능)
-        self.main_container.bind("<Button-1>", self._on_touch_start)
-        self.main_container.bind("<B1-Motion>", self._on_touch_drag)
-        self.main_container.bind_all("<MouseWheel>", self._on_mousewheel)
+    with col3:
+        st.write("")
+        st.write("")
+        if st.button("+ 새 현장 추가", use_container_width=True):
+            add_site(st.session_state.get("new_site_name", ""))
+            st.rerun()
 
-        self.main_container.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
+    selected_site = st.session_state.get("selected_site", "")
+    export_filename, export_text = build_export_text(selected_site)
+    if export_text:
+        st.download_button(
+            "TXT 내보내기",
+            data=export_text.encode("utf-8"),
+            file_name=export_filename,
+            mime="text/plain",
+        )
 
-        # 3. 실제 카드들이 담길 내부 컨테이너 (너비 고정하여 중앙 정렬)
-        inner_content = tk.Frame(self.scrollable_frame, bg="#F5F7FA")
-        inner_content.pack(padx=20, pady=10, expand=True)
+    st.divider()
 
-        # --- [카드 1: 현장 및 관리] ---
-        card1 = self.create_card(inner_content, "현장 및 관리")
-        sub1 = tk.Frame(card1, bg="white")
-        sub1.pack(pady=5)
-        self.combo_site = ttk.Combobox(sub1, font=("맑은 고딕", 12), state="readonly", width=25)
-        self.combo_site.grid(row=0, column=0, padx=10, pady=10)
-        self.update_site_list()
-        
-        btn_f = tk.Frame(sub1, bg="white")
-        btn_f.grid(row=0, column=1)
-        tk.Button(btn_f, text="+ 새 현장", command=self.add_site, bg="#3B82F6", fg="white", relief="flat", font=("맑은 고딕", 10, "bold"), padx=15).pack(side="left", padx=5)
-        tk.Button(btn_f, text="TXT 내보내기", command=self.export_to_txt, bg="#8B5CF6", fg="white", relief="flat", font=("맑은 고딕", 10, "bold"), padx=15).pack(side="left", padx=5)
+    st.subheader("2. 수위계 제원 정보")
+    cols = st.columns(2)
+    for i, (label, state_key) in enumerate(INFO_FIELDS):
+        with cols[i % 2]:
+            st.text_input(label, key=f"info_{state_key}")
 
-        # --- [카드 2: 수위계 제원] ---
-        card2 = self.create_card(inner_content, "수위계 제원 정보")
-        sub2 = tk.Frame(card2, bg="white")
-        sub2.pack()
-        specs = ["관리번호:", "수위계 S/N:", "천공심도(m):", "수위(m):", "설치위치(m):"]
-        self.entries_info = {}
-        for i, label in enumerate(specs):
-            r, c = divmod(i, 2)
-            f = tk.Frame(sub2, bg="white")
-            f.grid(row=r, column=c, padx=20, pady=5)
-            tk.Label(f, text=label, bg="white", font=("맑은 고딕", 10)).pack(anchor="w")
-            ent = tk.Entry(f, font=("맑은 고딕", 12), bg="#F8FAFC", relief="solid", borderwidth=1, width=25)
-            ent.pack(pady=2)
-            self.entries_info[label] = ent
+    st.divider()
 
-        # --- [카드 3: 성적서 LGF 비교] ---
-        card3 = self.create_card(inner_content, "성적서(Spec) 정보 및 비교")
-        sub3 = tk.Frame(card3, bg="white")
-        sub3.pack()
-        tk.Label(sub3, text="성적서 L.G.F", bg="white", font=("맑은 고딕", 10)).grid(row=0, column=0, sticky="w", padx=15)
-        self.ent_spec_lgf = tk.Entry(sub3, font=("맑은 고딕", 13, "bold"), bg="#FFFBEB", fg="#B45309", relief="solid", borderwidth=1, width=25, justify="center")
-        self.ent_spec_lgf.grid(row=1, column=0, padx=15, pady=5)
-        self.lbl_compare = tk.Label(sub3, text="성적서 대비 일치율: - %", font=("맑은 고딕", 12, "bold"), bg="white", fg="#059669")
-        self.lbl_compare.grid(row=1, column=1, padx=20)
+    st.subheader("3. 성적서(Spec) 정보 및 비교")
+    col1, col2 = st.columns([1, 1.2])
+    with col1:
+        st.text_input("성적서 L.G.F", key="spec_lgf", placeholder="예: 0.0001234")
+    with col2:
+        match_rate = st.session_state.get("match_rate")
+        if match_rate is None:
+            st.info("성적서 대비 일치율: - %")
+        else:
+            if match_rate >= 90:
+                st.success(f"성적서 대비 일치율: {match_rate:.2f} %")
+            else:
+                st.error(f"성적서 대비 일치율: {match_rate:.2f} %")
 
-        # --- [카드 4: 단계별 측정] ---
-        card4 = self.create_card(inner_content, "설치 단계별 V/W 측정값")
-        sub4 = tk.Frame(card4, bg="white")
-        sub4.pack()
-        stages = ["설치 전 측정치", "설치 후 측정치", "초기치"]
-        self.entries_base = {}
-        for c, h in enumerate(["구분", "Digits (Hz²/1000)", "온도 (℃)"]):
-            tk.Label(sub4, text=h, bg="white", font=("맑은 고딕", 10, "bold"), fg="#64748B").grid(row=0, column=c, padx=20, pady=5)
-        for i, stage in enumerate(stages):
-            tk.Label(sub4, text=stage, bg="white", font=("맑은 고딕", 10)).grid(row=i+1, column=0, padx=20, pady=5)
-            ed = tk.Entry(sub4, font=("맑은 고딕", 12), bg="#F1F5F9", relief="flat", width=18, justify="center")
-            ed.grid(row=i+1, column=1, padx=5, pady=2)
-            et = tk.Entry(sub4, font=("맑은 고딕", 12), bg="#F1F5F9", relief="flat", width=18, justify="center")
-            et.grid(row=i+1, column=2, padx=5, pady=2)
-            self.entries_base[stage] = {"Digits": ed, "Temp": et}
+    st.divider()
 
-        # --- [카드 5: 캘리브레이션 측정] ---
-        card5 = self.create_card(inner_content, "현장 L.G.F 도출 측정 (1m 간격)")
-        sub5_btn = tk.Frame(card5, bg="white")
-        sub5_btn.pack(pady=5)
-        tk.Button(sub5_btn, text="행 추가 +", command=self.add_calib_row, bg="#E2E8F0", relief="flat", padx=15).pack(side="left", padx=10)
-        tk.Button(sub5_btn, text="행 삭제 -", command=self.remove_calib_row, bg="#E2E8F0", relief="flat", padx=15).pack(side="left", padx=10)
-        self.calib_container = tk.Frame(card5, bg="white")
-        self.calib_container.pack(pady=10)
-        tk.Label(self.calib_container, text="수심(m)", bg="white", font=("맑은 고딕", 9, "bold"), width=15).grid(row=0, column=0)
-        tk.Label(self.calib_container, text="측정 Digits", bg="white", font=("맑은 고딕", 9, "bold"), width=20).grid(row=0, column=1)
-        for _ in range(5): self.add_calib_row()
+    st.subheader("4. 설치 단계별 V/W 측정값")
+    header_cols = st.columns([1.2, 1, 1])
+    header_cols[0].markdown("**구분**")
+    header_cols[1].markdown("**Digits (Hz²/1000)**")
+    header_cols[2].markdown("**온도 (℃)**")
 
-        # 4. 결과 출력 및 하단 액션 버튼
-        action_frame = tk.Frame(inner_content, bg="#F5F7FA")
-        action_frame.pack(fill="x", pady=25)
-        tk.Button(action_frame, text="L.G.F 계산 및 비교 실행", command=self.calculate_lgf, bg="#0F172A", fg="white", font=("맑은 고딕", 13, "bold"), height=2, width=35).pack()
-        self.lbl_result = tk.Label(action_frame, text="현장 계산 L.G.F : -", font=("맑은 고딕", 15, "bold"), bg="#F5F7FA", fg="#EF4444")
-        self.lbl_result.pack(pady=10)
+    for stage in BASE_STAGES:
+        row_cols = st.columns([1.2, 1, 1])
+        row_cols[0].write(stage)
+        row_cols[1].text_input(
+            f"{stage}_digits",
+            key=f"base_digits_{stage}",
+            label_visibility="collapsed",
+        )
+        row_cols[2].text_input(
+            f"{stage}_temp",
+            key=f"base_temp_{stage}",
+            label_visibility="collapsed",
+        )
 
-        footer_btns = tk.Frame(inner_content, bg="#F5F7FA")
-        footer_btns.pack(fill="x", pady=10)
-        tk.Button(footer_btns, text="데이터 저장", command=self.save_data, bg="#22C55E", fg="white", font=("맑은 고딕", 11, "bold"), width=15, height=2).pack(side="left", padx=15)
-        tk.Button(footer_btns, text="목록보기/삭제", command=self.load_data_dialog, bg="#F59E0B", fg="white", font=("맑은 고딕", 11, "bold"), width=15, height=2).pack(side="left", padx=15)
-        tk.Button(footer_btns, text="초기화", command=self.clear_all, bg="#64748B", fg="white", font=("맑은 고딕", 11, "bold"), width=10, height=2).pack(side="right", padx=15)
+    st.divider()
 
-    # --- 유틸리티 및 디자인 함수 ---
-    def create_card(self, parent, title):
-        container = tk.Frame(parent, bg="#F5F7FA")
-        container.pack(fill="x", pady=10)
-        card = tk.Frame(container, bg="white", highlightbackground="#E2E8F0", highlightthickness=1)
-        card.pack(fill="x", ipadx=15, ipady=15)
-        tk.Label(card, text=title, bg="white", font=("맑은 고딕", 12, "bold"), fg="#1E293B").pack(pady=(5, 15))
-        return card
+    st.subheader("5. 현장 L.G.F 도출 측정 (1m 간격)")
+    btn_cols = st.columns([1, 1, 4])
 
-    # --- 태블릿 터치 스크롤 제어 로직 ---
-    def _on_touch_start(self, event):
-        self.main_container.scan_mark(event.x, event.y)
+    with btn_cols[0]:
+        if st.button("행 추가 +", use_container_width=True):
+            st.session_state["calib_count"] += 1
+            st.rerun()
 
-    def _on_touch_drag(self, event):
-        self.main_container.scan_dragto(event.x, event.y, gain=1)
+    with btn_cols[1]:
+        if st.button("행 삭제 -", use_container_width=True):
+            if st.session_state["calib_count"] > 1:
+                idx = st.session_state["calib_count"] - 1
+                st.session_state[f"calib_depth_{idx}"] = ""
+                st.session_state[f"calib_digits_{idx}"] = ""
+                st.session_state["calib_count"] -= 1
+            st.rerun()
 
-    def _on_mousewheel(self, event):
-        self.main_container.yview_scroll(int(-1*(event.delta/120)), "units")
+    head_cols = st.columns([0.5, 1, 1])
+    head_cols[0].markdown("**No.**")
+    head_cols[1].markdown("**수심(m)**")
+    head_cols[2].markdown("**측정 Digits**")
 
-    # --- 비즈니스 로직 ---
-    def update_site_list(self):
-        sites = [d for d in os.listdir(self.base_dir) if os.path.isdir(os.path.join(self.base_dir, d))]
-        self.combo_site['values'] = sites
-        if sites: self.combo_site.current(0)
+    for i in range(st.session_state["calib_count"]):
+        row_cols = st.columns([0.5, 1, 1])
+        row_cols[0].write(i + 1)
+        row_cols[1].text_input(
+            f"depth_{i}",
+            key=f"calib_depth_{i}",
+            label_visibility="collapsed",
+            placeholder="예: 1.0",
+        )
+        row_cols[2].text_input(
+            f"digits_{i}",
+            key=f"calib_digits_{i}",
+            label_visibility="collapsed",
+            placeholder="예: 12345.67",
+        )
 
-    def add_site(self):
-        name = simpledialog.askstring("현장 추가", "현장명을 입력하세요:")
-        if name:
-            path = os.path.join(self.base_dir, name)
-            if not os.path.exists(path): os.makedirs(path)
-            self.update_site_list()
-            self.combo_site.set(name)
+    st.divider()
 
-    def add_calib_row(self):
-        idx = len(self.calib_rows) + 1
-        e1 = tk.Entry(self.calib_container, font=("맑은 고딕", 12), justify="center", bg="#F8FAFC", width=15)
-        e1.grid(row=idx, column=0, padx=5, pady=3)
-        e2 = tk.Entry(self.calib_container, font=("맑은 고딕", 12), justify="center", bg="#F8FAFC", width=20)
-        e2.grid(row=idx, column=1, padx=5, pady=3)
-        self.calib_rows.append((e1, e2))
+    st.subheader("6. 계산 결과")
+    if st.button("L.G.F 계산 및 비교 실행", use_container_width=True, type="primary"):
+        ok, msg = calculate_lgf()
+        if ok:
+            st.success(msg)
+        else:
+            st.warning(msg)
 
-    def remove_calib_row(self):
-        if len(self.calib_rows) > 1:
-            e1, e2 = self.calib_rows.pop()
-            e1.destroy(); e2.destroy()
+    current_lgf = st.session_state.get("current_lgf_field", 0.0)
+    if current_lgf:
+        st.metric("현장 계산 L.G.F", f"{current_lgf:.7f}")
+    else:
+        st.metric("현장 계산 L.G.F", "-")
 
-    def calculate_lgf(self):
-        try:
-            depths, digits = [], []
-            for d_e, dig_e in self.calib_rows:
-                if d_e.get() and dig_e.get():
-                    depths.append(float(d_e.get()))
-                    digits.append(float(dig_e.get()))
-            if len(depths) < 2:
-                messagebox.showwarning("입력 부족", "데이터를 2개 이상 입력하세요.")
-                return
-            base_d, base_dig = depths[0], digits[0]
-            lgfs = []
-            for i in range(1, len(depths)):
-                dp = (depths[i] - base_d) * 0.1
-                dd = digits[i] - base_dig
-                if dd != 0: lgfs.append(dp / dd)
-            self.current_lgf_field = sum(lgfs) / len(lgfs)
-            self.lbl_result.config(text=f"현장 계산 L.G.F : {self.current_lgf_field:.7f}")
-            spec_val = self.ent_spec_lgf.get()
-            if spec_val:
-                spec_lgf = float(spec_val)
-                match_rate = (min(abs(spec_lgf), abs(self.current_lgf_field)) / max(abs(spec_lgf), abs(self.current_lgf_field))) * 100
-                self.lbl_compare.config(text=f"성적서 대비 일치율: {match_rate:.2f} %")
-                self.lbl_compare.config(fg="#059669" if match_rate >= 90 else "#EF4444")
-        except: messagebox.showerror("오류", "숫자 형식을 확인하세요.")
+    st.divider()
 
-    def save_data(self):
-        site = self.combo_site.get()
-        mng_no = self.entries_info["관리번호:"].get().strip()
-        if not site or not mng_no:
-            messagebox.showwarning("필수", "현장명과 관리번호를 입력하세요.")
-            return
-        data = {
-            "info": {k: v.get() for k, v in self.entries_info.items()},
-            "spec_lgf": self.ent_spec_lgf.get(),
-            "base": {k: {"Digits": v["Digits"].get(), "Temp": v["Temp"].get()} for k, v in self.entries_base.items()},
-            "calib": [{"depth": d.get(), "digits": dig.get()} for d, dig in self.calib_rows],
-            "field_lgf": self.current_lgf_field
-        }
-        with open(os.path.join(self.base_dir, site, f"{mng_no}.json"), 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        messagebox.showinfo("저장 완료", f"{mng_no} 데이터가 저장되었습니다.")
+    st.subheader("7. 저장 / 불러오기 / 삭제")
+    action_cols = st.columns([1, 1])
 
-    def export_to_txt(self):
-        site = self.combo_site.get()
-        if not site: return
-        site_path = os.path.join(self.base_dir, site)
-        files = [f for f in os.listdir(site_path) if f.endswith('.json')]
-        if not files:
-            messagebox.showinfo("알림", "저장된 데이터가 없습니다.")
-            return
-        now = datetime.now().strftime("%Y%m%d_%H%M")
-        export_file = f"{site}_일괄데이터_{now}.txt"
-        with open(export_file, 'w', encoding='utf-8') as out:
-            out.write(f"=== {site} 지하수위계 일괄 데이터 ===\n\n")
-            for f_name in files:
-                with open(os.path.join(site_path, f_name), 'r', encoding='utf-8') as f:
-                    d = json.load(f)
-                out.write(f"■ 관리번호: {d['info'].get('관리번호:', 'N/A')}\n")
-                out.write(f"S/N: {d['info'].get('수위계 S/N:', '')} | 현장LGF: {d.get('field_lgf', 0):.7f}\n")
-                out.write(f"성적서LGF: {d.get('spec_lgf', '미입력')}\n")
-                out.write(f"------------------------------------------\n")
-        messagebox.showinfo("내보내기 성공", f"'{export_file}' 파일이 생성되었습니다.")
+    with action_cols[0]:
+        if st.button("데이터 저장", use_container_width=True):
+            ok, msg = save_data()
+            if ok:
+                st.success(msg)
+            else:
+                st.warning(msg)
 
-    def load_data_dialog(self):
-        site = self.combo_site.get()
-        if not site: return
-        site_path = os.path.join(self.base_dir, site)
-        files = [f.replace('.json', '') for f in os.listdir(site_path) if f.endswith('.json')]
-        win = tk.Toplevel(self.root)
-        win.title("데이터 목록")
-        win.geometry("400x550")
-        lb = tk.Listbox(win, font=("맑은 고딕", 11)); lb.pack(fill="both", expand=True, padx=20, pady=20)
-        for f in files: lb.insert(tk.END, f)
-        
-        def do_load():
-            if not lb.curselection(): return
-            name = lb.get(lb.curselection())
-            with open(os.path.join(site_path, f"{name}.json"), 'r', encoding='utf-8') as f:
-                d = json.load(f)
-            self.clear_all()
-            for k, v in d["info"].items(): 
-                if k in self.entries_info: self.entries_info[k].insert(0, v)
-            self.ent_spec_lgf.insert(0, d.get("spec_lgf", ""))
-            for k, v in d["base"].items():
-                if k in self.entries_base:
-                    self.entries_base[k]["Digits"].insert(0, v["Digits"])
-                    self.entries_base[k]["Temp"].insert(0, v["Temp"])
-            cal_d = d["calib"]
-            while len(self.calib_rows) < len(cal_d): self.add_calib_row()
-            for i, row in enumerate(cal_d):
-                self.calib_rows[i][0].insert(0, row["depth"])
-                self.calib_rows[i][1].insert(0, row["digits"])
-            self.current_lgf_field = d.get("field_lgf", 0)
-            self.lbl_result.config(text=f"현장 계산 L.G.F : {self.current_lgf_field:.7f}")
-            win.destroy()
+    with action_cols[1]:
+        if st.button("초기화", use_container_width=True):
+            clear_all()
+            st.success("입력값을 초기화했습니다.")
+            st.rerun()
 
-        def do_del():
-            if not lb.curselection(): return
-            name = lb.get(lb.curselection())
-            if messagebox.askyesno("삭제", f"{name} 데이터를 삭제하시겠습니까?"):
-                os.remove(os.path.join(site_path, f"{name}.json"))
-                lb.delete(lb.curselection())
+    records = list_records(selected_site)
+    record_options = [""] + records
+    if st.session_state["record_to_manage"] not in record_options:
+        st.session_state["record_to_manage"] = ""
 
-        tk.Button(win, text="데이터 불러오기", command=do_load, bg="#3B82F6", fg="white", font=("맑은 고딕", 10, "bold"), height=2).pack(fill="x", padx=30, pady=5)
-        tk.Button(win, text="데이터 삭제", command=do_del, bg="#EF4444", fg="white", font=("맑은 고딕", 10), height=1).pack(fill="x", padx=30, pady=5)
+    col1, col2 = st.columns([2, 1])
 
-    def clear_all(self):
-        for e in self.entries_info.values(): e.delete(0, tk.END)
-        self.ent_spec_lgf.delete(0, tk.END)
-        self.lbl_compare.config(text="성적서 대비 일치율: - %", fg="#059669")
-        for d in self.entries_base.values():
-            d["Digits"].delete(0, tk.END); d["Temp"].delete(0, tk.END)
-        while len(self.calib_rows) > 5: self.remove_calib_row()
-        for e1, e2 in self.calib_rows: e1.delete(0, tk.END); e2.delete(0, tk.END)
-        self.lbl_result.config(text="현장 계산 L.G.F : -")
+    with col1:
+        st.selectbox(
+            "저장된 데이터 목록",
+            options=record_options,
+            key="record_to_manage",
+            format_func=lambda x: "데이터를 선택하세요" if x == "" else x,
+        )
+
+    with col2:
+        st.checkbox("삭제 확인", key="delete_confirm")
+
+    manage_cols = st.columns([1, 1])
+
+    with manage_cols[0]:
+        if st.button("데이터 불러오기", use_container_width=True):
+            ok, msg = load_data(selected_site, st.session_state.get("record_to_manage", ""))
+            if ok:
+                st.success(msg)
+                st.rerun()
+            else:
+                st.warning(msg)
+
+    with manage_cols[1]:
+        if st.button("데이터 삭제", use_container_width=True):
+            if not st.session_state.get("delete_confirm", False):
+                st.warning("삭제 확인을 체크하세요.")
+            else:
+                ok, msg = delete_data(selected_site, st.session_state.get("record_to_manage", ""))
+                if ok:
+                    st.session_state["record_to_manage"] = ""
+                    st.session_state["delete_confirm"] = False
+                    st.success(msg)
+                    st.rerun()
+                else:
+                    st.warning(msg)
+
+    st.caption("기존 Tkinter 버전과 동일한 JSON 저장 형식을 유지하므로 기존 데이터도 그대로 읽을 수 있습니다.")
+
 
 if __name__ == "__main__":
-    root = tk.Tk()
-    app = TabletPiezometerApp(root)
-    root.mainloop()
+    main()
